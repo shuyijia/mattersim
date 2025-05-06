@@ -823,6 +823,54 @@ class Potential(nn.Module):
                     output["stresses"] = stresses
 
         return output
+    
+    def get_node_feats(
+        self,
+        input: Dict[str, torch.Tensor],
+        include_forces: bool = True,
+        include_stresses: bool = True,
+        dataset_idx: int = -1,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        get energy, force and stress from a list of graph
+        Args:
+            input: a dictionary contains all necessary info.
+                   The `batch_to_dict` method could convert a graph_batch from
+                   pyg dataloader to the input dictionary.
+            include_forces (bool): whether to include force
+            include_stresses (bool): whether to include stress
+            dataset_idx (int): used for multi-head model, set to -1 by default
+        Returns:
+            results: a dictionary, which consists of energies,
+                     forces and stresses
+        """
+        output = {}
+        if self.model_name == "graphormer" or self.model_name == "geomformer":
+            raise NotImplementedError
+        else:
+            strain = torch.zeros_like(input["cell"], device=self.device)
+            volume = torch.linalg.det(input["cell"])
+            if include_forces is True:
+                input["atom_pos"].requires_grad_(True)
+            if include_stresses is True:
+                strain.requires_grad_(True)
+                input["cell"] = torch.matmul(
+                    input["cell"],
+                    (torch.eye(3, device=self.device)[None, ...] + strain),
+                )
+                strain_augment = torch.repeat_interleave(
+                    strain, input["num_atoms"], dim=0
+                )
+                input["atom_pos"] = torch.einsum(
+                    "bi, bij -> bj",
+                    input["atom_pos"],
+                    (torch.eye(3, device=self.device)[None, ...] + strain_augment),
+                )
+                volume = torch.linalg.det(input["cell"])
+
+            node_feats, energies = self.model.get_node_feats(input, dataset_idx)
+
+        return node_feats, energies
 
     def save(self, save_path):
         dir_name = os.path.dirname(save_path)

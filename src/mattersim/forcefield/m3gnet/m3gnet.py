@@ -144,6 +144,81 @@ class M3Gnet(nn.Module):
         energies = scatter(energies_i, batch, dim=0, dim_size=num_graphs)
 
         return energies  # [batch_size]
+    
+    def get_node_feats(
+        self,
+        input: Dict[str, torch.Tensor],
+        dataset_idx: int = -1,
+    ) -> torch.Tensor:
+        # Exact data from input_dictionary
+        pos = input["atom_pos"]
+        cell = input["cell"]
+        pbc_offsets = input["pbc_offsets"].float()
+        atom_attr = input["atom_attr"]
+        edge_index = input["edge_index"].long()
+        three_body_indices = input["three_body_indices"].long()
+        num_three_body = input["num_three_body"]
+        num_bonds = input["num_bonds"]
+        num_triple_ij = input["num_triple_ij"]
+        num_atoms = input["num_atoms"]
+        num_graphs = input["num_graphs"]
+        batch = input["batch"]
+
+        # -------------------------------------------------------------#
+        cumsum = torch.cumsum(num_bonds, dim=0) - num_bonds
+        index_bias = torch.repeat_interleave(  # noqa: F501
+            cumsum, num_three_body, dim=0
+        ).unsqueeze(-1)
+        three_body_indices = three_body_indices + index_bias
+
+        # === Refer to the implementation of M3GNet,        ===
+        # === we should re-compute the following attributes ===
+        # edge_length, edge_vector(optional), triple_edge_length, theta_jik
+        atoms_batch = torch.repeat_interleave(repeats=num_atoms)
+        edge_batch = atoms_batch[edge_index[0]]
+        edge_vector = pos[edge_index[0]] - (
+            pos[edge_index[1]]
+            + torch.einsum("bi, bij->bj", pbc_offsets, cell[edge_batch])
+        )
+        edge_length = torch.linalg.norm(edge_vector, dim=1)
+        vij = edge_vector[three_body_indices[:, 0].clone()]
+        vik = edge_vector[three_body_indices[:, 1].clone()]
+        rij = edge_length[three_body_indices[:, 0].clone()]
+        rik = edge_length[three_body_indices[:, 1].clone()]
+        cos_jik = torch.sum(vij * vik, dim=1) / (rij * rik)
+        # eps = 1e-7 avoid nan in torch.acos function
+        cos_jik = torch.clamp(cos_jik, min=-1.0 + 1e-7, max=1.0 - 1e-7)
+        triple_edge_length = rik.view(-1)
+        edge_length = edge_length.unsqueeze(-1)
+        atomic_numbers = atom_attr.squeeze(1).long()
+
+        # featurize
+        atom_attr = self.atom_embedding(self.one_hot_atoms(atomic_numbers))
+        edge_attr = self.rbf(edge_length.view(-1))
+        edge_attr_zero = edge_attr  # e_ij^0
+        edge_attr = self.edge_encoder(edge_attr)
+        three_basis = self.sbf(triple_edge_length, torch.acos(cos_jik))
+
+        # Main Loop
+        for idx, conv in enumerate(self.graph_conv):
+            atom_attr, edge_attr = conv(
+                atom_attr,
+                edge_attr,
+                edge_attr_zero,
+                edge_index,
+                three_basis,
+                three_body_indices,
+                edge_length,
+                num_bonds,
+                num_triple_ij,
+                num_atoms,
+            )
+
+        energies_i = self.final(atom_attr).view(-1)  # [batch_size*num_atoms]
+        energies_i = self.normalizer(energies_i, atomic_numbers)
+        energies = scatter(energies_i, batch, dim=0, dim_size=num_graphs)
+
+        return atom_attr, energies
 
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
